@@ -478,7 +478,7 @@ input,select,textarea,button{font-family:inherit}
         <div>
           <div class="a-sec-t">Tambah Pengguna Baru</div>
           <div class="a-frow"><label class="a-lbl">Nama Pengguna</label><input class="a-inp" id="cnu-name" placeholder="cth: guru_ali"></div>
-          <div class="a-frow"><label class="a-lbl">Kata Laluan</label><input class="a-inp" id="cnu-pw" type="password" placeholder="min. 4 aksara"></div>
+          <div class="a-note" style="margin:2px 0 6px">Kata laluan akan dijana secara automatik (random) — anda akan diberi kata laluan itu selepas tambah, untuk diserahkan kepada pengguna.</div>
           <div class="a-frow"><label class="a-lbl">Peranan</label>
             <select class="a-inp" id="cnu-role" style="cursor:pointer">
               <option value="user">Pengguna — edit carta sendiri</option>
@@ -490,7 +490,7 @@ input,select,textarea,button{font-family:inherit}
         </div>
         <div style="border-top:1px solid rgba(255,255,255,.07);padding-top:13px">
           <div style="font-size:11px;font-weight:700;color:#ef4444;margin-bottom:8px">Zon Bahaya</div>
-          <button onclick="if(confirm('Log keluar semua?')){CARTA_AUTH.session=null;cartaSaveAUTH();cartaDoLogout();}" style="border:1px solid #7f1d1d;background:none;color:#fca5a5;border-radius:6px;font-size:11px;padding:6px 14px;cursor:pointer;font-family:'Sora',sans-serif">Log Keluar Semua</button>
+          <button onclick="if(confirm('Log keluar dari akaun ini?')){cartaDoLogout();}" style="border:1px solid #7f1d1d;background:none;color:#fca5a5;border-radius:6px;font-size:11px;padding:6px 14px;cursor:pointer;font-family:'Sora',sans-serif">Log Keluar</button>
         </div>
       </div>
       <div id="cadt-pw" style="display:none;flex-direction:column;gap:13px">
@@ -836,6 +836,22 @@ input,select,textarea,button{font-family:inherit}
 </div>
 <script>
 
+// ══════════════════════════════════════════════
+// SUPABASE CONFIG + TENANT (SEKOLAH)
+// ══════════════════════════════════════════════
+var SB_URL = 'https://aowzftmdriukxbltjtpm.supabase.co';
+var SB_ANON_KEY = 'PASTE_ANON_KEY_DI_SINI'; // <-- ganti dengan anon key projek Supabase
+var SB_FN_ADMIN = SB_URL + '/functions/v1/orgchart-admin';
+
+// Kod sekolah dari URL: contoh orgchart.cikgukita.com/?t=SMKABC01
+var urlParams = new URLSearchParams(window.location.search);
+var KOD_SEKOLAH = (urlParams.get('t') || '').trim().toUpperCase();
+
+function sbMakeEmail(username, kodSekolah){
+  var u = (username||'').trim().toLowerCase().replace(/[^a-z0-9_.]/g,'');
+  var k = (kodSekolah||'').trim().toLowerCase().replace(/[^a-z0-9]/g,'');
+  return u + '.' + k + '@cikgukita.internal';
+}
 
 // ══════════════════════════════════════════════
 // UNDO / REDO
@@ -1060,67 +1076,111 @@ function getLevel(nodeId, depth){
 // ══════════════════════════════════════════════
 // AUTH & PERSISTENCE SYSTEM
 // ══════════════════════════════════════════════
-var CARTA_AKEY = 'carta_auth_v1';
-var CARTA_AUTH = null;
+// CARTA_SESS: {access_token, refresh_token, user_id}
+// CARTA_CU:   {username, role, kod_sekolah, must_change_password}
+var CARTA_SKEY = 'carta_sess_v2_' + (KOD_SEKOLAH||'nokod');
+var CARTA_SESS = null;
 var CARTA_CU   = null;
-var CARTA_DKEY = 'carta_data_v1'; // overridden per user
 
-function cartaLoadAUTH(){
-  try{ return JSON.parse(localStorage.getItem(CARTA_AKEY)); }catch(e){ return null; }
+function cartaLoadSess(){ try{ return JSON.parse(localStorage.getItem(CARTA_SKEY)); }catch(e){ return null; } }
+function cartaSaveSess(){ localStorage.setItem(CARTA_SKEY, JSON.stringify(CARTA_SESS)); }
+function cartaClearSess(){ localStorage.removeItem(CARTA_SKEY); }
+
+// ── Wrapper: panggil Supabase REST/Auth dengan token semasa ──
+async function sbFetch(path, opts){
+  opts = opts || {};
+  var headers = Object.assign({
+    'apikey': SB_ANON_KEY,
+    'Content-Type': 'application/json'
+  }, opts.headers||{});
+  if(CARTA_SESS && CARTA_SESS.access_token){
+    headers['Authorization'] = 'Bearer ' + CARTA_SESS.access_token;
+  } else {
+    headers['Authorization'] = 'Bearer ' + SB_ANON_KEY;
+  }
+  var res = await fetch(SB_URL + path, Object.assign({}, opts, {headers:headers}));
+  return res;
 }
-function cartaSaveAUTH(){ localStorage.setItem(CARTA_AKEY, JSON.stringify(CARTA_AUTH)); }
 
-function cartaBoot(){
-  CARTA_AUTH = cartaLoadAUTH();
-  if(!CARTA_AUTH){
-    CARTA_AUTH = {
-      users:[{username:'admin', password:'admin123', role:'admin'}],
-      session: null
-    };
-    cartaSaveAUTH();
+async function cartaRefreshToken(){
+  if(!CARTA_SESS || !CARTA_SESS.refresh_token) return false;
+  var res = await sbFetch('/auth/v1/token?grant_type=refresh_token', {
+    method:'POST', body: JSON.stringify({refresh_token: CARTA_SESS.refresh_token})
+  });
+  if(!res.ok) return false;
+  var d = await res.json();
+  CARTA_SESS = {access_token:d.access_token, refresh_token:d.refresh_token, user_id:d.user.id};
+  cartaSaveSess();
+  return true;
+}
+
+async function cartaBoot(){
+  if(!KOD_SEKOLAH){
+    document.getElementById('auth-screen').style.display='flex';
+    document.getElementById('auth-err').textContent='URL tiada kod sekolah (?t=KODSEKOLAH). Hubungi admin.';
+    return;
   }
-  // Auto-login if session exists
-  if(CARTA_AUTH.session){
-    var u = CARTA_AUTH.users.find(function(x){ return x.username===CARTA_AUTH.session.username; });
-    if(u){ CARTA_CU=u; cartaLoginOK(); return; }
+  CARTA_SESS = cartaLoadSess();
+  if(CARTA_SESS && CARTA_SESS.access_token){
+    var ok = await cartaFetchProfile();
+    if(ok){ cartaLoginOK(); return; }
+    // token expired -> cuba refresh
+    var refreshed = await cartaRefreshToken();
+    if(refreshed && await cartaFetchProfile()){ cartaLoginOK(); return; }
   }
-  // Show auth screen
+  cartaClearSess(); CARTA_SESS=null; CARTA_CU=null;
   document.getElementById('auth-screen').style.display = 'flex';
 }
 
-function cartaDoLogin(){
+async function cartaFetchProfile(){
+  try{
+    var res = await sbFetch('/rest/v1/orgchart_data?select=username,role,kod_sekolah,must_change_password&user_id=eq.'+CARTA_SESS.user_id, {method:'GET'});
+    if(!res.ok) return false;
+    var rows = await res.json();
+    if(!rows.length) return false;
+    CARTA_CU = rows[0];
+    return true;
+  }catch(e){ return false; }
+}
+
+async function cartaDoLogin(){
   var u = document.getElementById('auth-user').value.trim();
   var p = document.getElementById('auth-pass').value;
   var err = document.getElementById('auth-err');
   err.textContent = '';
+  if(!KOD_SEKOLAH){ err.textContent='URL tiada kod sekolah (?t=KODSEKOLAH).'; return; }
   if(!u||!p){ err.textContent='Sila isi semua maklumat.'; return; }
-  var found = CARTA_AUTH.users.find(function(x){ return x.username===u && x.password===p; });
-  if(!found){ err.textContent='Nama pengguna atau kata laluan tidak sah.'; return; }
-  CARTA_CU = found;
-  CARTA_AUTH.session = {username: u};
-  cartaSaveAUTH();
-  document.getElementById('auth-pass').value = '';
-  cartaLoginOK();
+  var email = sbMakeEmail(u, KOD_SEKOLAH);
+  try{
+    var res = await sbFetch('/auth/v1/token?grant_type=password', {
+      method:'POST', body: JSON.stringify({email:email, password:p})
+    });
+    if(!res.ok){ err.textContent='Nama pengguna atau kata laluan tidak sah.'; return; }
+    var d = await res.json();
+    CARTA_SESS = {access_token:d.access_token, refresh_token:d.refresh_token, user_id:d.user.id};
+    cartaSaveSess();
+    var ok = await cartaFetchProfile();
+    if(!ok){ err.textContent='Akaun wujud tapi profil tidak dijumpai. Hubungi admin.'; return; }
+    document.getElementById('auth-pass').value = '';
+    cartaLoginOK();
+  }catch(e){ err.textContent='Ralat sambungan. Cuba lagi.'; }
 }
 
 function cartaLoginOK(){
   document.getElementById('auth-screen').style.display = 'none';
-  document.getElementById('app').style.display = 'flex';
-  // Per-user data key
-  CARTA_DKEY = 'carta_data_v1_' + CARTA_CU.username;
-  cartaRenderUserBar();
-  // Load saved data or sample
-  if(!cartaLoadData()){
-    loadSample();
+  if(CARTA_CU.must_change_password){
+    cartaForcePwScreen();
+    return;
   }
+  document.getElementById('app').style.display = 'flex';
+  cartaRenderUserBar();
+  cartaLoadData().then(function(ok){ if(!ok) loadSample(); });
   toast('Selamat datang, ' + CARTA_CU.username + '! 👋');
 }
 
 function cartaDoLogout(){
-  // Clear state
   nodes = []; selId = null; uid = 1;
-  CARTA_CU = null; CARTA_AUTH.session = null; cartaSaveAUTH();
-  // Reset UI
+  CARTA_CU = null; CARTA_SESS = null; cartaClearSess();
   document.getElementById('app').style.display = 'none';
   document.getElementById('auth-screen').style.display = 'flex';
   document.getElementById('auth-user').value = '';
@@ -1136,12 +1196,40 @@ function cartaRenderUserBar(){
   var rb = CARTA_CU.role==='admin'
     ? '<span class="ui-rbadge-admin">ADMIN</span>'
     : '<span class="ui-rbadge-guru">PENGGUNA</span>';
-  bar.innerHTML = '<span class="ui-name">&#128100; '+CARTA_CU.username+'</span>' + rb
+  bar.innerHTML = '<span class="ui-name">&#128100; '+CARTA_CU.username+' &middot; '+KOD_SEKOLAH+'</span>' + rb
     + (CARTA_CU.role==='admin' ? '<button class="ui-admbtn" onclick="cartaOpenAdmin()">&#9881; Admin</button>' : '')
     + '<button class="ui-outbtn" onclick="cartaDoLogout()">Keluar</button>';
 }
 
-// ── Admin panel ──
+// ── First-login: paksa tukar pasword random ──
+function cartaForcePwScreen(){
+  var scr = document.getElementById('auth-screen');
+  scr.style.display='flex';
+  scr.querySelector('.auth-card').innerHTML =
+    '<div class="auth-card-title">Set Kata Laluan Baru</div>'+
+    '<div class="a-note" style="margin-bottom:10px">Ini kali pertama anda log masuk. Sila tetapkan kata laluan baru anda sendiri.</div>'+
+    '<div class="a-grp"><label class="a-lbl">Kata Laluan Baru</label><input class="a-inp" id="fpw-new" type="password" placeholder="min. 6 aksara"></div>'+
+    '<div class="a-grp"><label class="a-lbl">Sahkan Kata Laluan</label><input class="a-inp" id="fpw-conf" type="password"></div>'+
+    '<button class="a-btn" onclick="cartaForcePwSubmit()">Simpan &amp; Teruskan &rarr;</button>'+
+    '<div class="a-err" id="fpw-err"></div>';
+}
+async function cartaForcePwSubmit(){
+  var nw = document.getElementById('fpw-new').value;
+  var cf = document.getElementById('fpw-conf').value;
+  var err = document.getElementById('fpw-err');
+  if(nw.length<6){ err.textContent='Min. 6 aksara.'; return; }
+  if(nw!==cf){ err.textContent='Tidak sepadan.'; return; }
+  var res = await sbFetch('/auth/v1/user', {method:'PUT', body: JSON.stringify({password:nw})});
+  if(!res.ok){ err.textContent='Gagal tukar kata laluan. Cuba lagi.'; return; }
+  await sbFetch('/rest/v1/orgchart_data?user_id=eq.'+CARTA_SESS.user_id, {
+    method:'PATCH', headers:{'Prefer':'return=minimal'},
+    body: JSON.stringify({must_change_password:false})
+  });
+  CARTA_CU.must_change_password = false;
+  location.reload(); // reset auth screen markup ke keadaan asal & login semula dengan bersih
+}
+
+// ── Admin panel (guna Edge Function orgchart-admin, service-role di server) ──
 function cartaOpenAdmin(){
   if(!CARTA_CU||CARTA_CU.role!=='admin') return;
   cartaRenderUserList();
@@ -1155,53 +1243,75 @@ function cartaAdmTab(tab, btn){
   document.querySelectorAll('.adm-tab').forEach(function(b){ b.classList.remove('on'); });
   btn.classList.add('on');
 }
-function cartaRenderUserList(){
-  var el=document.getElementById('carta-user-list'); el.innerHTML='';
-  CARTA_AUTH.users.forEach(function(u,i){
-    var r=document.createElement('div'); r.className='adm-row';
-    r.innerHTML='<span class="adm-row-name">'+u.username+'</span>'
-      +'<span class="rbadge '+(u.role==='admin'?'rb-admin':'rb-guru')+'">'+(u.role==='admin'?'Admin':'Pengguna')+'</span>'
-      +(u.username==='admin'
-        ?'<span style="font-size:9px;color:#334155">Dilindungi</span>'
-        :'<button class="adm-del" onclick="cartaDelUser('+i+')">Buang</button>');
-    el.appendChild(r);
+async function cartaAdminFn(action, payload){
+  var res = await fetch(SB_FN_ADMIN, {
+    method:'POST',
+    headers:{'Content-Type':'application/json','Authorization':'Bearer '+CARTA_SESS.access_token,'apikey':SB_ANON_KEY},
+    body: JSON.stringify(Object.assign({action:action}, payload||{}))
   });
+  var d = await res.json();
+  if(!res.ok) throw new Error(d.error||'Ralat pelayan');
+  return d;
 }
-function cartaAddUser(){
+async function cartaRenderUserList(){
+  var el=document.getElementById('carta-user-list'); el.innerHTML='Memuatkan...';
+  try{
+    var d = await cartaAdminFn('list_users');
+    el.innerHTML='';
+    d.users.forEach(function(u){
+      var r=document.createElement('div'); r.className='adm-row';
+      r.innerHTML='<span class="adm-row-name">'+u.username+'</span>'
+        +'<span class="rbadge '+(u.role==='admin'?'rb-admin':'rb-guru')+'">'+(u.role==='admin'?'Admin':'Pengguna')+'</span>'
+        +(u.must_change_password?'<span style="font-size:9px;color:#f59e0b">Belum set pasword</span>':'')
+        +(u.username===CARTA_CU.username
+          ?'<span style="font-size:9px;color:#334155">Anda</span>'
+          :'<button class="adm-del" onclick="cartaDelUser(\''+u.username+'\')">Buang</button>');
+      el.appendChild(r);
+    });
+  }catch(e){ el.innerHTML='<span class="a-bad">Gagal muat senarai: '+e.message+'</span>'; }
+}
+async function cartaAddUser(){
   var n=document.getElementById('cnu-name').value.trim();
-  var p=document.getElementById('cnu-pw').value;
   var r=document.getElementById('cnu-role').value;
   var m=document.getElementById('carta-msg-user');
   if(!n){m.innerHTML='<span class="a-bad">Nama diperlukan.</span>';return;}
-  if(p.length<4){m.innerHTML='<span class="a-bad">Min. 4 aksara.</span>';return;}
-  if(CARTA_AUTH.users.find(function(u){return u.username===n;})){m.innerHTML='<span class="a-bad">Nama sudah wujud.</span>';return;}
-  CARTA_AUTH.users.push({username:n,password:p,role:r});
-  cartaSaveAUTH(); cartaRenderUserList();
-  document.getElementById('cnu-name').value=''; document.getElementById('cnu-pw').value='';
-  m.innerHTML='<span class="a-ok">&#10003; "'+n+'" ditambah.</span>';
-  setTimeout(function(){m.textContent='';},3000);
+  m.innerHTML='Mencipta akaun...';
+  try{
+    var d = await cartaAdminFn('create_user', {username:n, role:r});
+    document.getElementById('cnu-name').value='';
+    m.innerHTML='<span class="a-ok">&#10003; Akaun "'+d.username+'" dicipta.<br>'+
+      'Kata laluan sementara: <b style="user-select:all">'+d.password+'</b><br>'+
+      '(Beri kepada pengguna — mereka akan diminta tukar pasword kali pertama log masuk)</span>';
+    cartaRenderUserList();
+  }catch(e){ m.innerHTML='<span class="a-bad">'+e.message+'</span>'; }
 }
-function cartaDelUser(i){
-  var u=CARTA_AUTH.users[i]; if(!u||u.username==='admin') return;
-  if(!confirm('Padam "'+u.username+'"?')) return;
-  CARTA_AUTH.users.splice(i,1); cartaSaveAUTH(); cartaRenderUserList();
+async function cartaDelUser(username){
+  if(!confirm('Padam "'+username+'"?')) return;
+  try{
+    await cartaAdminFn('delete_user', {username:username});
+    cartaRenderUserList();
+  }catch(e){ alert('Gagal padam: '+e.message); }
 }
-function cartaChangePw(){
+async function cartaChangePw(){
   var cur=document.getElementById('cpw-cur').value;
   var nw=document.getElementById('cpw-new').value;
   var cf=document.getElementById('cpw-conf').value;
   var m=document.getElementById('carta-msg-pw');
-  if(CARTA_CU.password!==cur){m.innerHTML='<span class="a-bad">Kata laluan semasa salah.</span>';return;}
-  if(nw.length<4){m.innerHTML='<span class="a-bad">Min. 4 aksara.</span>';return;}
+  if(!cur){m.innerHTML='<span class="a-bad">Isi kata laluan semasa.</span>';return;}
+  if(nw.length<6){m.innerHTML='<span class="a-bad">Min. 6 aksara.</span>';return;}
   if(nw!==cf){m.innerHTML='<span class="a-bad">Tidak sepadan.</span>';return;}
-  var idx=CARTA_AUTH.users.findIndex(function(u){return u.username===CARTA_CU.username;});
-  if(idx>=0){CARTA_AUTH.users[idx].password=nw;CARTA_CU.password=nw;cartaSaveAUTH();}
+  // sahkan kata laluan semasa dgn log masuk semula secara senyap
+  var email = sbMakeEmail(CARTA_CU.username, KOD_SEKOLAH);
+  var verify = await sbFetch('/auth/v1/token?grant_type=password', {method:'POST', body: JSON.stringify({email:email,password:cur})});
+  if(!verify.ok){ m.innerHTML='<span class="a-bad">Kata laluan semasa salah.</span>'; return; }
+  var res = await sbFetch('/auth/v1/user', {method:'PUT', body: JSON.stringify({password:nw})});
+  if(!res.ok){ m.innerHTML='<span class="a-bad">Gagal tukar.</span>'; return; }
   m.innerHTML='<span class="a-ok">&#10003; Berjaya ditukar.</span>';
   ['cpw-cur','cpw-new','cpw-conf'].forEach(function(id){document.getElementById(id).value='';});
   setTimeout(function(){m.textContent='';},3000);
 }
 
-// ── Auto-save with indicator ──
+// ── Auto-save with indicator (Supabase REST, bukan localStorage) ──
 var _cartaSaveTimer = null;
 function cartaScheduleSave(){
   var ind=document.getElementById('save-ind');
@@ -1210,8 +1320,10 @@ function cartaScheduleSave(){
   clearTimeout(_cartaSaveTimer);
   _cartaSaveTimer = setTimeout(function(){ cartaSaveData(); }, 1200);
 }
-function cartaSaveData(){
-  if(!CARTA_CU) return;
+async function cartaSaveData(){
+  if(!CARTA_CU||!CARTA_SESS) return;
+  var ind=document.getElementById('save-ind');
+  var txt=document.getElementById('save-txt');
   try{
     var hdr={org:document.getElementById('hOrg').textContent,title:document.getElementById('hTitle').textContent,sub:document.getElementById('hSub').textContent};
     var cw=document.getElementById('cwrap');
@@ -1220,20 +1332,23 @@ function cartaSaveData(){
       settings:{showPhoto:showPhoto,showDept:showDept,showContact:showContact,showNote:showNote,showArrow:showArrow,nodeSty:nodeSty,curFont:curFont,curFontSz:curFontSz,connSty:connSty,bgPat:bgPat,bgColor:bgColor,bgGrad:bgGrad},
       bg:{color:cw.style.background, image:cw.style.backgroundImage, size:cw.style.backgroundSize}
     };
-    localStorage.setItem(CARTA_DKEY, JSON.stringify(state));
-    var ind=document.getElementById('save-ind');
-    var txt=document.getElementById('save-txt');
+    var res = await sbFetch('/rest/v1/orgchart_data?user_id=eq.'+CARTA_SESS.user_id, {
+      method:'PATCH', headers:{'Prefer':'return=minimal'},
+      body: JSON.stringify({data: state})
+    });
+    if(!res.ok) throw new Error('save failed');
     if(ind){ind.classList.remove('saving','err');if(txt)txt.textContent='Tersimpan';}
   }catch(e){
-    var ind=document.getElementById('save-ind');
-    var txt=document.getElementById('save-txt');
     if(ind){ind.classList.add('err');if(txt)txt.textContent='Gagal simpan';}
   }
 }
-function cartaLoadData(){
+async function cartaLoadData(){
   try{
-    var raw=localStorage.getItem(CARTA_DKEY); if(!raw) return false;
-    var d=JSON.parse(raw);
+    var res = await sbFetch('/rest/v1/orgchart_data?select=data&user_id=eq.'+CARTA_SESS.user_id, {method:'GET'});
+    if(!res.ok) return false;
+    var rows = await res.json();
+    if(!rows.length || !rows[0].data || !Object.keys(rows[0].data).length) return false;
+    var d = rows[0].data;
     if(d.nodes&&d.nodes.length){ nodes=d.nodes; uid=d.uid||nodes.length+1; }
     if(d.hdr){
       if(d.hdr.org) document.getElementById('hOrg').textContent=d.hdr.org;
@@ -2050,5 +2165,18 @@ document.addEventListener('DOMContentLoaded',function(){
 </button>
 
 </div><!-- /app -->
+<script>
+// ── KEEP-ALIVE — pastikan Supabase tidak tidur ──────────────
+(function(){
+  var _kaUrl = typeof SUPA_URL !== 'undefined' ? SUPA_URL : (typeof SB_URL !== 'undefined' ? SB_URL : '');
+  var _kaKey = typeof SUPA_KEY !== 'undefined' ? SUPA_KEY : (typeof SB_KEY !== 'undefined' ? SB_KEY : '');
+  if (!_kaUrl || !_kaKey) return;
+  if (window._ekKaTimer) clearInterval(window._ekKaTimer);
+  window._ekKaTimer = setInterval(function(){
+    fetch(_kaUrl+'/rest/v1/', {headers:{'apikey':_kaKey,'Authorization':'Bearer '+_kaKey}}).catch(function(){});
+  }, 4*60*1000);
+  console.log('EduKit keep-alive started');
+})();
+</script>
 </body>
 </html>
